@@ -51,6 +51,139 @@ printf_null(const char *format, ...)
 
 #define XQC_TEST_DGRAM_BATCH_SZ 32
 
+/* XUP/1: ultra-simple upload protocol over QUIC Streams */
+#define XUP_ALPN  "xup/1"
+#define XUP_MAGIC "XUP1"
+
+typedef enum { XUP_ST_HEADER=0, XUP_ST_BODY, XUP_ST_REPLY, XUP_ST_DONE, XUP_ST_ERR } xup_state_t;
+
+typedef struct xup_stream_ctx_s {
+    xqc_stream_t *stream;
+    xup_state_t   st;
+    uint8_t       hbuf[2048];
+    size_t        hlen;
+    uint8_t       flags;
+    uint64_t      file_size;
+    char         *filename;
+    FILE         *fp;
+    uint64_t      received;
+    uint8_t       rbuf[256];
+    size_t        rlen;
+} xup_stream_ctx_t;
+
+/* --- QUIC varint helpers (subset) --- */
+static size_t xup_read_varint(const uint8_t *p, const uint8_t *end, uint64_t *out) {
+    if (p >= end) {
+        return 0;
+    }
+    uint8_t b0 = *p;
+
+    if ((b0 & 0xC0) == 0x00) { /* 1 byte */
+        *out = b0 & 0x3F;
+        return 1;
+    } else if ((b0 & 0xC0) == 0x40) { /* 2 bytes */
+        if (p + 2 > end) return 0;
+        *out = ((uint64_t)(b0 & 0x3F) << 8) | p[1];
+        return 2;
+    } else if ((b0 & 0xC0) == 0x80) { /* 4 bytes */
+        if (p + 4 > end) return 0;
+        *out = ((uint64_t)(b0 & 0x3F) << 24)
+             | ((uint64_t)p[1] << 16) | ((uint64_t)p[2] << 8) | (uint64_t)p[3];
+        return 4;
+    } else { /* 8 bytes */
+        if (p + 8 > end) return 0;
+        *out = ((uint64_t)(b0 & 0x3F) << 56)
+             | ((uint64_t)p[1] << 48) | ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32)
+             | ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) | ((uint64_t)p[6] << 8) | (uint64_t)p[7];
+        return 8;
+    }
+}
+
+static size_t xup_write_varint(uint8_t *p, uint64_t v) {
+    if (v < 64) {
+        p[0] = (uint8_t)v;
+        return 1;
+    } else if (v < (1ULL << 14)) {
+        p[0] = 0x40 | (uint8_t)(v >> 8);
+        p[1] = (uint8_t)v;
+        return 2;
+    } else if (v < (1ULL << 30)) {
+        p[0] = 0x80 | (uint8_t)(v >> 24);
+        p[1] = (uint8_t)(v >> 16);
+        p[2] = (uint8_t)(v >> 8);
+        p[3] = (uint8_t)v;
+        return 4;
+    } else {
+        p[0] = 0xC0 | (uint8_t)(v >> 56);
+        p[1] = (uint8_t)(v >> 48);
+        p[2] = (uint8_t)(v >> 40);
+        p[3] = (uint8_t)(v >> 32);
+        p[4] = (uint8_t)(v >> 24);
+        p[5] = (uint8_t)(v >> 16);
+        p[6] = (uint8_t)(v >> 8);
+        p[7] = (uint8_t)v;
+        return 8;
+    }
+}
+
+static int xup_decode_header(xup_stream_ctx_t *s) {
+    if (s->hlen < 4 + 1 + 1) {
+        return 0; /* incomplete */
+    }
+
+    const uint8_t *p   = s->hbuf;
+    const uint8_t *end = s->hbuf + s->hlen;
+
+    if (memcmp(p, XUP_MAGIC, 4) != 0) {
+        return -1;
+    }
+    p += 4;
+
+    s->flags = *p++;
+
+    uint64_t namelen = 0;
+    size_t n = xup_read_varint(p, end, &namelen);
+    if (!n) return 0;
+    p += n;
+
+    if (p + namelen > end) return 0;
+
+    s->filename = (char *)malloc(namelen + 1);
+    if (!s->filename) return -1;
+    memcpy(s->filename, p, namelen);
+    s->filename[namelen] = '\0';
+    p += namelen;
+
+    uint64_t fsz = 0;
+    n = xup_read_varint(p, end, &fsz);
+    if (!n) return 0;
+    p += n;
+    s->file_size = fsz;
+
+    size_t consumed = (size_t)(p - s->hbuf);
+    size_t remain   = s->hlen - consumed;
+    if (remain) {
+        memmove(s->hbuf, p, remain);
+    }
+    s->hlen = remain;
+
+    return 1; /* header complete */
+}
+
+static void xup_make_reply(xup_stream_ctx_t *s, uint8_t status, const char *msg) {
+    uint8_t *p = s->rbuf;
+    *p++ = status;
+    size_t mlen = msg ? strlen(msg) : 0;
+    p += xup_write_varint(p, mlen);
+    if (mlen) {
+        memcpy(p, msg, mlen);
+        p += mlen;
+    }
+    s->rlen = (size_t)(p - s->rbuf);
+}
+
+
+
 extern long xqc_random(void);
 extern xqc_usec_t xqc_now();
 
@@ -81,6 +214,7 @@ typedef struct user_stream_s {
     xqc_stream_t            *stream;
     xqc_h3_request_t        *h3_request;
     uint64_t                 send_offset;
+    xup_stream_ctx_t        *xup;  /* XUP/1 per-stream context */
     int                      header_sent;
     int                      header_recvd;
     char                    *send_body;
@@ -812,6 +946,13 @@ xqc_server_stream_create_notify(xqc_stream_t *stream, void *user_data)
     user_stream->stream = stream;
     xqc_stream_set_user_data(stream, user_stream);
 
+    /*
+    xup/1
+    */
+    user_stream->xup = calloc(1, sizeof(*user_stream->xup));
+    user_stream->xup->stream = stream;
+    user_stream->xup->st = XUP_ST_HEADER;
+
     if (g_test_case == 99) {
         xqc_stream_send(stream, NULL, 0, 1);
     }
@@ -823,91 +964,89 @@ xqc_server_stream_create_notify(xqc_stream_t *stream, void *user_data)
     return 0;
 }
 
-int
-xqc_server_stream_close_notify(xqc_stream_t *stream, void *user_data)
-{
+int xqc_server_stream_close_notify(xqc_stream_t *stream, void *user_data) {
     DEBUG;
-    user_stream_t *user_stream = (user_stream_t*)user_data;
-    free(user_stream->send_body);
-    free(user_stream->recv_body);
-    free(user_stream);
-
+    user_stream_t *us = (user_stream_t*)user_data;
+    if (!us) return 0;
+    if (us->xup) {
+        if (us->xup->fp) fclose(us->xup->fp);
+        free(us->xup->filename);
+        free(us->xup);
+    }
+    free(us->send_body);
+    free(us->recv_body);
+    free(us);
     return 0;
 }
 
-int
-xqc_server_stream_write_notify(xqc_stream_t *stream, void *user_data)
-{
-    //DEBUG;
-    int ret = xqc_server_stream_send(stream, user_data);
-    return ret;
+int xqc_server_stream_write_notify(xqc_stream_t *stream, void *user_data) {
+    user_stream_t *us = (user_stream_t*)user_data;
+    if (!us || !us->xup) return 0;
+    xup_stream_ctx_t *s = us->xup;
+    if (s->st == XUP_ST_REPLY && s->rlen) {
+        ssize_t w = xqc_stream_send(stream, s->rbuf, s->rlen, 1);
+        if (w >= 0) s->st = XUP_ST_DONE;
+    }
+    return 0;
 }
 
-int
-xqc_server_stream_read_notify(xqc_stream_t *stream, void *user_data)
-{
-    //DEBUG;
+
+int xqc_server_stream_read_notify(xqc_stream_t *stream, void *user_data) {
     unsigned char fin = 0;
-    user_stream_t *user_stream = (user_stream_t *) user_data;
+    user_stream_t *us = (user_stream_t*)user_data;
+    xup_stream_ctx_t *s = us->xup;
+    uint8_t buf[16*1024];
 
-    if (g_echo && user_stream->recv_body == NULL) {
-        user_stream->recv_body = malloc(MAX_BUF_SIZE);
-        if (user_stream->recv_body == NULL) {
-            printf("recv_body malloc error\n");
-            return -1;
+    for (;;) {
+        ssize_t n = xqc_stream_recv(stream, buf, sizeof(buf), &fin);
+        if (n == -XQC_EAGAIN) break;
+        if (n < 0) return 0;
+        size_t off = 0;
+
+        while (off < (size_t)n) {
+            if (s->st == XUP_ST_HEADER) {
+                size_t cp = n - off;
+                if (s->hlen + cp > sizeof(s->hbuf)) cp = sizeof(s->hbuf) - s->hlen;
+                memcpy(s->hbuf + s->hlen, buf + off, cp);
+                s->hlen += cp; off += cp;
+
+                int r = xup_decode_header(s);
+                if (r < 0) { s->st = XUP_ST_ERR; xup_make_reply(s, 1, "bad header"); break; }
+                if (r == 1) {
+                    /* 保存先：カレント直下にファイル名で作成（必要ならパスを組む） */
+                    s->fp = fopen(s->filename, "wb");
+                    if (!s->fp) { s->st = XUP_ST_ERR; xup_make_reply(s, 1, "open failed"); break; }
+                    s->st = XUP_ST_BODY;
+                    if (s->hlen) {
+                        size_t w = fwrite(s->hbuf, 1, s->hlen, s->fp);
+                        s->received += w; s->hlen = 0;
+                    }
+                }
+            } else if (s->st == XUP_ST_BODY) {
+                size_t towrite = n - off;
+                if (s->received + towrite > s->file_size)
+                    towrite = (size_t)(s->file_size - s->received);
+                if (towrite) {
+                    size_t w = fwrite(buf + off, 1, towrite, s->fp);
+                    s->received += w; off += w;
+                    if (w == 0) { s->st = XUP_ST_ERR; xup_make_reply(s, 1, "write error"); break; }
+                }
+                if (s->received == s->file_size) {
+                    fflush(s->fp); fclose(s->fp); s->fp = NULL;
+                    s->st = XUP_ST_REPLY;
+                    xup_make_reply(s, 0, "ok");
+                }
+            } else { off = n; break; }
         }
     }
 
-    int save = g_save_body;
-
-    if (save && user_stream->recv_body_fp == NULL) {
-        user_stream->recv_body_fp = fopen(g_write_file, "wb");
-        if (user_stream->recv_body_fp == NULL) {
-            printf("open error\n");
-            return -1;
-        }
-    }
-
-    char buff[4096] = {0};
-    size_t buff_size = 4096;
-    ssize_t read;
-    ssize_t read_sum = 0;
-    do {
-        read = xqc_stream_recv(stream, buff, buff_size, &fin);
-        if (read == -XQC_EAGAIN) {
-            break;
-
-        } else if (read < 0) {
-            printf("xqc_stream_recv error %zd\n", read);
-            return 0;
-        }
-        read_sum += read;
-
-        /* write received body to file */
-        if (save && fwrite(buff, 1, read, user_stream->recv_body_fp) != read) {
-            printf("fwrite error\n");
-            return -1;
-        }
-
-        if (save) {
-            fflush(user_stream->recv_body_fp);
-        }
-
-        /* write received body to memory */
-        if (g_echo) {
-            memcpy(user_stream->recv_body + user_stream->recv_body_len, buff, read);
-        }
-        user_stream->recv_body_len += read;
-    } while (read > 0 && !fin);
-
-    // mpshell
-    // printf("xqc_stream_recv read:%zd, offset:%zu, fin:%d\n", read_sum, user_stream->recv_body_len, fin);
-
-    if (fin) {
-        xqc_server_stream_send(stream, user_data);
+    if (s->st == XUP_ST_REPLY) {
+        xqc_stream_send(stream, s->rbuf, s->rlen, 1);
+        s->st = XUP_ST_DONE;
     }
     return 0;
 }
+
 
 int
 xqc_server_h3_conn_create_notify(xqc_h3_conn_t *h3_conn, const xqc_cid_t *cid, void *conn_user_data)
@@ -2720,7 +2859,8 @@ int main(int argc, char *argv[]) {
 #endif
     }
 
-    xqc_engine_register_alpn(ctx.engine, XQC_ALPN_TRANSPORT, 9, &ap_cbs, NULL);
+    xqc_engine_register_alpn(ctx.engine, XUP_ALPN, sizeof(XUP_ALPN)-1, &ap_cbs, NULL);
+
 
     if (g_test_case == 10) {
         xqc_h3_engine_set_max_field_section_size(ctx.engine, 10000000);
