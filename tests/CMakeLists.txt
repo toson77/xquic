@@ -29,6 +29,10 @@ set(TEST_CLIENT_SOURCES
     test_client.c
 )
 
+set(XUP_CLIENT_SOURCES
+    xup_client.c
+)
+
 if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
     set(GETOPT_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/getopt.c
@@ -43,12 +47,19 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
         ${TEST_CLIENT_SOURCES}
         ${GETOPT_SOURCES}
     )
+
+    set(XUP_CLIENT_SOURCES
+        ${XUP_CLIENT_SOURCES}
+        ${GETOPT_SOURCES}
+    )
 endif()
 
 
 ### test client/server ###
 add_executable(test_server ${TEST_SERVER_SOURCES})
 add_executable(test_client ${TEST_CLIENT_SOURCES})
+add_executable(xup_client ${XUP_CLIENT_SOURCES})
+
 
 # link libraries
 if(CMAKE_SYSTEM_NAME MATCHES "Windows")
@@ -72,6 +83,7 @@ endif()
 
 target_link_libraries(test_server ${APP_DEPEND_LIBS})
 target_link_libraries(test_client ${APP_DEPEND_LIBS})
+target_link_libraries(xup_client ${APP_DEPEND_LIBS})
 
 
 # build run_tests
